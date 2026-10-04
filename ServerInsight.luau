@@ -338,7 +338,7 @@ end
 local function identifyLagSource(frameTime, snapshot)
 	local report = {
 		Cause = "Unknown",
-		Severity = frameTime > config.CriticalThreshold and "Critical" or "Warning",
+		Severity = frameTime > config.CriticalThreshold and "Critical" or frameTime > config.WarnThreshold and "Warning" or "Normal",
 		FrameTime = frameTime,
 		Details = {},
 		Timestamp = os.time(),
@@ -458,7 +458,7 @@ local function formatReport(report)
 
 	local lines = {
 		string.format(
-			"\n[ServerInsight] %s DETECTED at %s",
+			"\n[ServerInsight] %s REPORT at %s",
 			report.Severity:upper(),
 			DateTime.fromUnixTimestamp(report.Timestamp):FormatLocalTime("LT", "en-us")
 		),
