@@ -3,7 +3,6 @@
 	ServerInsight
 	Server-sided performance monitoring.
 	Made by: Iconx9912 | v1.3.0
-	Roblox: icozdev
 	Created: Jan 30, 2026
 	Last updated: October 3, 2026
 
@@ -63,7 +62,7 @@
 
 	REPORTS INCLUDE:
 	- Cause (what's lagging the server)
-	- Severity (Warning / Critical)
+	- Severity (Normal / Warning / Critical)
 	- Frame time
 	- Extra details + suggestions
 	- Timestamp
@@ -82,22 +81,26 @@
 	v1.2.0 - Previous release.
 ]]
 
+--Services used throughout the module.
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Stats = game:GetService("Stats")
 
 local ServerInsight = {}
 
+--These events let other server scripts react to warnings without changing the monitoring loop.
 local warningEvent = Instance.new("BindableEvent")
 local criticalEvent = Instance.new("BindableEvent")
 
 ServerInsight.OnWarning = warningEvent.Event
 ServerInsight.OnCritical = criticalEvent.Event
 
+--These limits control how much history is kept and how often more expensive checks run.
 local MAX_HISTORY = 60
 local FRAME_SAMPLES = 10
 local SCRIPT_COUNT_REFRESH = 30
 
+--These are the default thresholds and checks used by the monitor. Start() can override them.
 local config = {
 	CheckInterval = 5,
 	WarnThreshold = 0.03,
@@ -117,22 +120,26 @@ local config = {
 	HighPlayerCount = 30
 }
 
+--Each monitoring session gets its own ID so an old loop cannot keep running after Stop() and Start().
 local runId = 0
 local isMonitoring = false
 local baselineFrameTime = 0
 local lastMemoryUsage = nil
 local lastNetwork = nil
 local performanceHistory = {}
+--Scanning every descendant is relatively expensive, so the script count is cached between refreshes.
 local scriptCountCache = {
 	Count = 0,
 	LastUpdate = -math.huge
 }
 
+--Reports use rounded values so small floating point differences do not make the output noisy.
 local function round(value, places)
 	local scale = 10 ^ places
 	return math.floor(value * scale + 0.5) / scale
 end
 
+--Stats properties can differ between environments, so pcall prevents a missing stat from stopping the monitor.
 local function readStat(name)
 	local ok, value = pcall(function()
 		return Stats[name]
@@ -140,9 +147,11 @@ local function readStat(name)
 	if ok and type(value) == "number" then
 		return value
 	end
+	--Returning 0 keeps later comparisons safe when Roblox does not expose the requested stat.
 	return 0
 end
 
+--Collect the counters that identify physics load and network activity.
 local function getCounts()
 	return {
 		InstanceCount = readStat("InstanceCount"),
@@ -154,6 +163,7 @@ local function getCounts()
 	}
 end
 
+--Keep the memory categories together because the report uses them to identify where growth is coming from.
 local function getMemoryStats()
 	return {
 		Total = Stats:GetTotalMemoryUsageMb(),
@@ -163,6 +173,7 @@ local function getMemoryStats()
 	}
 end
 
+--Averaging several Heartbeat samples makes the measurement less dependent on one unusually slow frame.
 local function sampleFrameTime(count)
 	local sum = 0
 	for _ = 1, count do
@@ -171,6 +182,7 @@ local function sampleFrameTime(count)
 	return sum / count
 end
 
+--The baseline represents normal server performance before the monitor starts looking for spikes.
 local function calculateBaseline()
 	task.wait(5)
 
@@ -184,12 +196,14 @@ local function calculateBaseline()
 	return samples[math.max(1, math.floor(#samples / 2))]
 end
 
+--The cache avoids repeatedly walking the entire game just to count active scripts.
 local function getScriptCount()
 	local now = os.clock()
 	if now - scriptCountCache.LastUpdate < SCRIPT_COUNT_REFRESH then
 		return scriptCountCache.Count
 	end
 
+	--Only enabled server Scripts count because disabled scripts are not doing work.
 	local count = 0
 	for _, descendant in ipairs(game:GetDescendants()) do
 		if descendant:IsA("Script") and not descendant.Disabled then
@@ -202,11 +216,13 @@ local function getScriptCount()
 	return count
 end
 
+--Network spikes are detected by comparing this sample with the previous committed sample.
 local function checkNetwork(counts, commit)
 	local sent = counts.DataSendKbps
 	local received = counts.DataReceiveKbps
 	local previous = lastNetwork
 
+	--Only committed snapshots become the next comparison point. Manual checks pass false so they do not alter the monitoring loop.
 	if commit then
 		lastNetwork = {
 			Sent = sent,
@@ -233,6 +249,7 @@ local function checkNetwork(counts, commit)
 	return {HasIssue = false}
 end
 
+--Large character hierarchies can add physics and replication work, so check them separately from the global counts.
 local function findHeavyCharacters()
 	local heavy = {}
 
@@ -259,6 +276,7 @@ local function findHeavyCharacters()
 	return heavy
 end
 
+--Keep recent frame times so later checks can determine whether performance is trending up or down.
 local function recordFrameTime(frameTime)
 	table.insert(performanceHistory, frameTime)
 	if #performanceHistory > MAX_HISTORY then
@@ -266,6 +284,7 @@ local function recordFrameTime(frameTime)
 	end
 end
 
+--Compare the older half of the history with the newer half instead of reacting to one sample.
 local function detectTrend()
 	local count = #performanceHistory
 	if count < 30 then
@@ -309,6 +328,7 @@ local function detectTrend()
 	return {HasTrend = false}
 end
 
+--A snapshot groups related measurements together so one lag report is based on the same check.
 local function takeSnapshot(commit)
 	local counts = getCounts()
 	local snapshot = {Counts = counts}
@@ -317,6 +337,7 @@ local function takeSnapshot(commit)
 		local memory = getMemoryStats()
 		snapshot.Memory = memory
 		snapshot.MemoryGrowth = lastMemoryUsage and (memory.Total - lastMemoryUsage) or 0
+		--Only monitoring snapshots update the previous value. Check() uses false so a manual check cannot reset the comparison used by the loop.
 		if commit then
 			lastMemoryUsage = memory.Total
 		end
@@ -329,12 +350,14 @@ local function takeSnapshot(commit)
 	return snapshot
 end
 
+--The first matching cause wins. That means the order of checks below determines which cause appears on the report when several problems exist.
 local function setCause(report, cause)
 	if report.Cause == "Unknown" then
 		report.Cause = cause
 	end
 end
 
+--Run the individual checks in a fixed order and add details or suggestions without changing the underlying measurements.
 local function identifyLagSource(frameTime, snapshot)
 	local report = {
 		Cause = "Unknown",
@@ -350,6 +373,7 @@ local function identifyLagSource(frameTime, snapshot)
 		or counts.MovingPrimitivesCount > config.MovingPartLimit
 		or counts.ContactsCount > config.ContactLimit
 
+	--Physics is checked first, so it gets priority if multiple possible causes are found.
 	if physicsOverloaded then
 		setCause(report, "Physics Overload")
 		report.Details.TotalParts = counts.PrimitivesCount
@@ -364,6 +388,7 @@ local function identifyLagSource(frameTime, snapshot)
 		end
 	end
 
+	--Memory growth is checked next because a rising total can point to cleanup or data problems.
 	if snapshot.Memory and snapshot.MemoryGrowth > config.MemoryGrowthThreshold then
 		local memory = snapshot.Memory
 		setCause(report, "Memory Growth")
@@ -379,6 +404,7 @@ local function identifyLagSource(frameTime, snapshot)
 		end
 	end
 
+	--Script count is a separate signal because a high number of active scripts can create unnecessary server work.
 	if config.TrackScripts then
 		local scriptCount = getScriptCount()
 		if scriptCount > config.ScriptCountLimit then
@@ -390,6 +416,7 @@ local function identifyLagSource(frameTime, snapshot)
 		end
 	end
 
+	--Network spikes can point to excessive remotes or replication rather than local physics work.
 	if snapshot.Network and snapshot.Network.HasIssue then
 		setCause(report, "Network Spike")
 		report.Details.NetworkSendKbps = snapshot.Network.SendKbps
@@ -398,6 +425,7 @@ local function identifyLagSource(frameTime, snapshot)
 		table.insert(report.Suggestions, "Check for excessive remote events or data replication")
 	end
 
+	--Player-specific checks help identify whether one or more characters are contributing unusual load.
 	if config.TrackPlayers then
 		local heavyCharacters = findHeavyCharacters()
 		if #heavyCharacters > 0 then
@@ -407,6 +435,7 @@ local function identifyLagSource(frameTime, snapshot)
 		end
 	end
 
+	--Trend detection looks at the stored history to catch gradual degradation that a single sample would miss.
 	if config.DetectTrends then
 		local trend = detectTrend()
 		if trend.HasTrend then
@@ -419,6 +448,7 @@ local function identifyLagSource(frameTime, snapshot)
 		end
 	end
 
+	--Player count is checked last because it can contribute to overall load without identifying a specific system.
 	local playerCount = #Players:GetPlayers()
 	if playerCount > config.HighPlayerCount then
 		report.Details.PlayerCount = playerCount
@@ -427,6 +457,7 @@ local function identifyLagSource(frameTime, snapshot)
 	end
 
 	if report.Cause == "Unknown" then
+		--If every specific check misses, the report keeps the general cause.
 		report.Cause = "General Performance Issue"
 		table.insert(report.Suggestions, "Frame time spike detected - cause unclear")
 		table.insert(report.Suggestions, "Check recent changes to your game or scripts")
@@ -435,6 +466,7 @@ local function identifyLagSource(frameTime, snapshot)
 	return report
 end
 
+--Convert table entries into readable key=value text so nested report details can be printed.
 local function describeItem(item)
 	if type(item) ~= "table" then
 		return tostring(item)
@@ -453,6 +485,7 @@ local function describeItem(item)
 	return table.concat(parts, " ")
 end
 
+--Turn the structured report into console text while keeping large lists from flooding the output.
 local function formatReport(report)
 	local threshold = report.Severity == "Critical" and config.CriticalThreshold or config.WarnThreshold
 
@@ -478,6 +511,7 @@ local function formatReport(report)
 			local value = report.Details[key]
 			if type(value) == "table" then
 				table.insert(lines, string.format("  %s: [%d items]", key, #value))
+				--Limit detailed list output so a large report does not fill the entire console.
 				for i, item in ipairs(value) do
 					if i > 3 then
 						break
@@ -503,12 +537,15 @@ local function formatReport(report)
 	return table.concat(lines, "\n")
 end
 
+--This loop owns the live monitoring session. The ID check prevents an older spawned loop from surviving a Stop() followed by Start().
 local function monitorLoop(id)
+	--Establish normal performance before the regular interval checks begin.
 	baselineFrameTime = calculateBaseline()
 	if id ~= runId then
 		return
 	end
 
+	--Commit the first snapshot so later network and memory checks have a previous value to compare against.
 	takeSnapshot(true)
 	print(string.format("[ServerInsight] Baseline frame time: %.2fms", baselineFrameTime * 1000))
 
@@ -529,6 +566,7 @@ local function monitorLoop(id)
 			#Players:GetPlayers()
 			))
 
+		--Only run detailed cause analysis after the frame time crosses the warning threshold.
 		if frameTime > config.WarnThreshold then
 			local report = identifyLagSource(frameTime, snapshot)
 
@@ -545,12 +583,15 @@ local function monitorLoop(id)
 	end
 end
 
+--Start one monitoring session and optionally replace only the settings supplied by the caller.
 function ServerInsight.Start(customConfig)
+	--Prevent two monitoring loops from running at the same time.
 	if isMonitoring then
 		warn("[ServerInsight] Already monitoring - call Stop() first to restart")
 		return
 	end
 
+	--Apply only known configuration keys so unrelated values cannot alter the module state.
 	if customConfig then
 		for key, value in pairs(customConfig) do
 			if config[key] ~= nil then
@@ -559,6 +600,7 @@ function ServerInsight.Start(customConfig)
 		end
 	end
 
+	--Incrementing the ID invalidates any older loop before the new one starts.
 	runId += 1
 	isMonitoring = true
 
@@ -572,9 +614,11 @@ function ServerInsight.Start(customConfig)
 	print("Track Players:", config.TrackPlayers)
 	print("Detect Trends:", config.DetectTrends)
 
+	--Run the monitor separately so Start() can return without waiting for the loop.
 	task.spawn(monitorLoop, runId)
 end
 
+--Stop the current session and clear comparison values so the next session starts cleanly.
 function ServerInsight.Stop()
 	isMonitoring = false
 	runId += 1
@@ -583,6 +627,7 @@ function ServerInsight.Stop()
 	print("[ServerInsight] Monitoring stopped")
 end
 
+--Return a fresh snapshot without changing the stored monitoring state.
 function ServerInsight.GetCurrentStats()
 	local counts = getCounts()
 	local memory = getMemoryStats()
@@ -602,10 +647,12 @@ function ServerInsight.GetCurrentStats()
 	}
 end
 
+--Return a copy so callers can inspect the history without modifying the module's internal table.
 function ServerInsight.GetPerformanceHistory()
 	return table.clone(performanceHistory)
 end
 
+--Recalculate the normal frame time only when the live monitor is stopped.
 function ServerInsight.ResetBaseline()
 	if isMonitoring then
 		warn("[ServerInsight] Cannot reset baseline while monitoring - call Stop() first")
@@ -616,6 +663,7 @@ function ServerInsight.ResetBaseline()
 	print(string.format("[ServerInsight] New baseline: %.2fms", baselineFrameTime * 1000))
 end
 
+--Run the same cause analysis manually, but do not commit its memory or network values as the next monitoring baseline.
 function ServerInsight.Check()
 	local frameTime = sampleFrameTime(FRAME_SAMPLES)
 	local snapshot = takeSnapshot(false)
